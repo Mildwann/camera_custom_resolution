@@ -1,23 +1,20 @@
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:open_camera/screens/camera_screen.dart';
+import 'package:flutter/services.dart';
+import 'package:open_camera/CameraPage.dart';
 
-late List<CameraDescription> cameras;
+const platform = MethodChannel('native_camera');
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  cameras = await availableCameras();
+void main() {
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Native Camera Demo',
-      home: CameraScreen(camera: cameras.first),
+      title: 'Native Camera Dynamic Resolution',
+      home: const CameraPage(),
       debugShowCheckedModeBanner: false,
     );
   }
