@@ -1,19 +1,26 @@
 package com.example.open_camera
 
+import android.content.ContentValues
 import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.media.ImageReader
-import android.os.Bundle
-import android.os.Environment
+import android.os.*
+import android.provider.MediaStore
+import android.util.Log
 import android.util.Size
-import android.util.SparseIntArray
 import android.view.Surface
+import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.*
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "native_camera"
@@ -24,9 +31,17 @@ class MainActivity : FlutterActivity() {
     private var surfaceTextureEntry: TextureRegistry.SurfaceTextureEntry? = null
     private var previewSize: Size? = null
     private var imageReader: ImageReader? = null
-    private var pendingResult: MethodChannel.Result? = null
+    
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+    // Handler สำหรับ ImageReader callback
+    private val backgroundHandler: Handler by lazy {
+        val thread = HandlerThread("CameraBackground").also { it.start() }
+        Handler(thread.looper)
+    }
+
+    private lateinit var methodChannelResult: MethodChannel.Result
+
+    override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
@@ -39,7 +54,7 @@ class MainActivity : FlutterActivity() {
                 "openCamera" -> {
                     val width = call.argument<Int>("width") ?: 640
                     val height = call.argument<Int>("height") ?: 480
-                    openCamera(width, height, result)
+                    openCamera(width, height, result, flutterEngine)
                 }
                 "changeResolution" -> {
                     val width = call.argument<Int>("width") ?: 640
@@ -54,46 +69,53 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun setupImageReader() {
-        imageReader = ImageReader.newInstance(previewSize!!.width, previewSize!!.height, android.graphics.ImageFormat.JPEG, 1)
-        imageReader!!.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireNextImage()
-            val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-
-            val file = createImageFile()
-            file.writeBytes(bytes)
-
-            image.close()
-            pendingResult?.success(file.absolutePath)
-            pendingResult = null
-        }, null)
+    private fun getSupportedResolutions(): List<Map<String, Int>> {
+        try {
+            val cameraId = cameraManager.cameraIdList[0] // กล้องหลัง
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf()
+            return sizes.map { size -> mapOf("width" to size.width, "height" to size.height) }
+        } catch (e: Exception) {
+            Log.e("NativeCamera", "Error getting supported resolutions: ${e.message}")
+            return emptyList()
+        }
     }
 
-    private fun openCamera(width: Int, height: Int, result: MethodChannel.Result) {
+    private fun openCamera(width: Int, height: Int, result: MethodChannel.Result, flutterEngine: FlutterEngine) {
         val cameraId = cameraManager.cameraIdList[0]
         previewSize = Size(width, height)
 
         closeCamera()
 
-        surfaceTextureEntry = flutterEngine?.renderer?.createSurfaceTexture()
+        surfaceTextureEntry = flutterEngine.renderer.createSurfaceTexture()
+
         if (surfaceTextureEntry == null) {
             result.error("UNAVAILABLE", "Failed to create SurfaceTexture", null)
             return
         }
 
-        setupImageReader()
+        // สร้าง ImageReader สำหรับถ่ายภาพความละเอียดเท่ากับ preview
+        imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 1)
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val buffer: ByteBuffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            saveImage(bytes)
+            image.close()
+        }, backgroundHandler)
 
         val surfaceTexture = surfaceTextureEntry!!.surfaceTexture()
         surfaceTexture.setDefaultBufferSize(previewSize!!.width, previewSize!!.height)
-        val surface = Surface(surfaceTexture)
+        val previewSurface = Surface(surfaceTexture)
+        val captureSurface = imageReader!!.surface
 
         try {
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraDevice = camera
-                    createCaptureSession(surface, result)
+                    createCaptureSessionWithImageReader(previewSurface, captureSurface, result)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -106,67 +128,37 @@ class MainActivity : FlutterActivity() {
                     cameraDevice = null
                     result.error("ERROR", "Camera error: $error", null)
                 }
-            }, null)
+            }, backgroundHandler)
         } catch (e: SecurityException) {
             result.error("PERMISSION_DENIED", "Camera permission denied", null)
+        } catch (e: CameraAccessException) {
+            result.error("ERROR", "Failed to open camera: ${e.message}", null)
         }
     }
 
-    private fun createCaptureSession(surface: Surface, result: MethodChannel.Result?) {
+    private fun createCaptureSessionWithImageReader(previewSurface: Surface, captureSurface: Surface, result: MethodChannel.Result?) {
         try {
             val captureRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            captureRequestBuilder.addTarget(surface)
-            imageReader?.surface?.let {
-                captureRequestBuilder.addTarget(it)
-            }
+            captureRequestBuilder.addTarget(previewSurface)
 
-            cameraDevice!!.createCaptureSession(listOf(surface, imageReader?.surface).filterNotNull(), object : CameraCaptureSession.StateCallback() {
+            cameraDevice!!.createCaptureSession(listOf(previewSurface, captureSurface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     captureSession = session
-                    captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-
-                    result?.success(surfaceTextureEntry!!.id())
+                    try {
+                        captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
+                        result?.success(surfaceTextureEntry!!.id())
+                    } catch (e: CameraAccessException) {
+                        result?.error("ERROR", "Failed to start preview: ${e.message}", null)
+                    }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     result?.error("ERROR", "Failed to configure capture session", null)
                 }
-            }, null)
+            }, backgroundHandler)
         } catch (e: CameraAccessException) {
             result?.error("ERROR", e.message, null)
-        }
-    }
-
-    private fun takePicture(result: MethodChannel.Result) {
-        if (cameraDevice == null || captureSession == null || imageReader == null) {
-            result.error("ERROR", "Camera not ready or ImageReader not initialized", null)
-            return
-        }
-
-        pendingResult = result
-
-        try {
-            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            captureBuilder.addTarget(imageReader!!.surface)
-            captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-
-            val rotation = windowManager.defaultDisplay.rotation
-            val characteristics = cameraManager.getCameraCharacteristics(cameraDevice!!.id)
-            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-            val jpegOrientation = (ORIENTATIONS[rotation] + sensorOrientation + 270) % 360
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
-
-            captureSession!!.stopRepeating()
-            captureSession!!.abortCaptures()
-            captureSession!!.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, resultCapture: TotalCaptureResult) {
-                    super.onCaptureCompleted(session, request, resultCapture)
-                    createCaptureSession(Surface(surfaceTextureEntry!!.surfaceTexture()), null)
-                }
-            }, null)
-        } catch (e: CameraAccessException) {
-            result.error("ERROR", e.message, null)
         }
     }
 
@@ -177,31 +169,117 @@ class MainActivity : FlutterActivity() {
         }
         previewSize = Size(width, height)
 
+        // ปิด ImageReader เดิมแล้วสร้างใหม่
+        imageReader?.close()
+        imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 1)
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val buffer: ByteBuffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            saveImage(bytes)
+            image.close()
+        }, backgroundHandler)
+
         val surfaceTexture = surfaceTextureEntry!!.surfaceTexture()
         surfaceTexture.setDefaultBufferSize(previewSize!!.width, previewSize!!.height)
-        val surface = Surface(surfaceTexture)
+        val previewSurface = Surface(surfaceTexture)
+        val captureSurface = imageReader!!.surface
 
         captureSession?.close()
-        createCaptureSession(surface, result)
+        createCaptureSessionWithImageReader(previewSurface, captureSurface, result)
     }
 
-    private fun getSupportedResolutions(): List<Map<String, Int>> {
+    private fun takePicture(result: MethodChannel.Result) {
+        if (cameraDevice == null || captureSession == null || imageReader == null) {
+            result.error("ERROR", "Camera not ready", null)
+            return
+        }
+        try {
+            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder.addTarget(imageReader!!.surface)
+            captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+
+            // หยุด preview ชั่วคราวก่อนถ่าย
+            captureSession!!.stopRepeating()
+
+            captureSession!!.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, resultCapture: TotalCaptureResult) {
+                    super.onCaptureCompleted(session, request, resultCapture)
+                    // เริ่ม preview ต่อหลังถ่ายเสร็จ
+                    try {
+                        val previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                        previewRequestBuilder.addTarget(Surface(surfaceTextureEntry!!.surfaceTexture()))
+                        previewRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        session.setRepeatingRequest(previewRequestBuilder.build(), null, backgroundHandler)
+                    } catch (e: CameraAccessException) {
+                        Log.e("NativeCamera", "Error restarting preview: $e")
+                    }
+                }
+            }, backgroundHandler)
+
+            result.success("capturing")
+        } catch (e: CameraAccessException) {
+            result.error("ERROR", "Failed to capture picture: ${e.message}", null)
+        }
+    }
+
+   private fun saveImage(bytes: ByteArray) {
+    val filename = "IMG_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
+    try {
+        // Load JPEG bytes into Bitmap
+        val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+        // Get camera orientation
         val cameraId = cameraManager.cameraIdList[0]
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf()
+        val orientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
 
-        return sizes.map { size -> mapOf("width" to size.width, "height" to size.height) }
-    }
+        // Rotate bitmap if needed
+        val matrix = android.graphics.Matrix()
+        matrix.postRotate(orientation.toFloat())
+        val rotatedBitmap = android.graphics.Bitmap.createBitmap(
+            originalBitmap,
+            0,
+            0,
+            originalBitmap.width,
+            originalBitmap.height,
+            matrix,
+            true
+        )
 
-    private fun createImageFile(): File {
-        val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-        if (!dir!!.exists()) {
-            dir.mkdirs()
+        // Convert rotated Bitmap back to JPEG ByteArray
+        val outputStream = java.io.ByteArrayOutputStream()
+        rotatedBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, outputStream)
+        val rotatedBytes = outputStream.toByteArray()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+            }
+
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri != null) {
+                contentResolver.openOutputStream(uri).use { it?.write(rotatedBytes) }
+                Log.d("NativeCamera", "Saved rotated image to $uri")
+            }
+        } else {
+            val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+            val file = File(picturesDir, filename)
+            FileOutputStream(file).use { it.write(rotatedBytes) }
+
+            val intent = android.content.Intent(android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+            intent.data = android.net.Uri.fromFile(file)
+            sendBroadcast(intent)
+            Log.d("NativeCamera", "Saved rotated image to ${file.absolutePath}")
         }
-        val fileName = "IMG_${System.currentTimeMillis()}.jpg"
-        return File(dir, fileName)
+    } catch (e: Exception) {
+        Log.e("NativeCamera", "Failed to save rotated image: ${e.message}")
     }
+}
+
 
     private fun closeCamera() {
         captureSession?.close()
@@ -210,19 +288,12 @@ class MainActivity : FlutterActivity() {
         cameraDevice = null
         surfaceTextureEntry?.release()
         surfaceTextureEntry = null
+        imageReader?.close()
+        imageReader = null
     }
 
     override fun onDestroy() {
         super.onDestroy()
         closeCamera()
-    }
-
-    companion object {
-        private val ORIENTATIONS = SparseIntArray().apply {
-            append(Surface.ROTATION_0, 90)
-            append(Surface.ROTATION_90, 0)
-            append(Surface.ROTATION_180, 270)
-            append(Surface.ROTATION_270, 180)
-        }
     }
 }
