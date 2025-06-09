@@ -8,6 +8,8 @@ import android.hardware.camera2.*
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.SparseIntArray
+import android.view.Surface
 import androidx.annotation.NonNull
 import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -84,10 +86,24 @@ class MainActivity : FlutterActivity() {
 
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
 
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val rotation = windowManager.defaultDisplay.rotation
+
+        val orientations = SparseIntArray().apply {
+            append(Surface.ROTATION_0, 90)
+            append(Surface.ROTATION_90, 0)
+            append(Surface.ROTATION_180, 270)
+            append(Surface.ROTATION_270, 180)
+        }
+
+        val jpegOrientation = (orientations.get(rotation) + sensorOrientation + 270) % 360
+
         cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 requestBuilder.addTarget(imageReader.surface)
+                requestBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
 
                 camera.createCaptureSession(
                     listOf(imageReader.surface),

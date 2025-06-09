@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'dart:ui';
 
 class NativeCamera {
   static const MethodChannel _channel = MethodChannel('custom_camera');

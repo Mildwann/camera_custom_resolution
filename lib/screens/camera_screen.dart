@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
@@ -19,36 +20,12 @@ class _CameraScreenState extends State<CameraScreen> {
 
   String? _selectedAspectRatio;
   Size? _selectedResolution;
-
-  final Map<String, List<Size>> aspectRatioToResolutions = {
-    '4:3': [
-      Size(640, 480), // VGA
-      Size(800, 600), // SVGA
-      Size(1024, 768), // XGA
-      Size(1280, 960), // SXGA-
-      Size(1600, 1200), // UXGA
-    ],
-    '16:9': [
-      Size(854, 480), // FWVGA
-      Size(1280, 720), // HD (720p)
-      Size(1920, 1080), // Full HD (1080p)
-      Size(2560, 1440), // QHD / 2K
-      Size(3840, 2160), // 4K UHD
-    ],
-    '1:1': [
-      Size(480, 480), // Square low res
-      Size(720, 720), // Medium square
-      Size(1080, 1080), // Full HD square
-    ],
-  };
+  Map<String, List<Size>> _aspectRatioToResolutions = {};
 
   @override
   void initState() {
     super.initState();
-    _selectedAspectRatio = aspectRatioToResolutions.keys.first;
-    _selectedResolution =
-        aspectRatioToResolutions[_selectedAspectRatio!]!.first;
-    _initializeCameraController();
+    _fetchSupportedResolutions();
   }
 
   double get aspectRatio {
@@ -56,15 +33,42 @@ class _CameraScreenState extends State<CameraScreen> {
     return _selectedResolution!.width / _selectedResolution!.height;
   }
 
-  Future<void> _initializeCameraController() async {
-    if (mounted) {
-      try {
-        await _controller.dispose();
-      } catch (_) {
-        // ignore error if _controller not initialized
-      }
+  Future<void> _fetchSupportedResolutions() async {
+    List<Size> allResolutions = await NativeCamera.getSupportedResolutions();
+
+    // กรองกลุ่ม aspect ratios
+    Map<String, List<Size>> grouped = {};
+    for (var size in allResolutions) {
+      double ratio = size.width / size.height;
+      String key = _approximateAspectRatio(ratio);
+      if (key.isEmpty) continue; // ข้ามพวกที่ไม่ใช่ 4:3, 16:9, 1:1
+      grouped.putIfAbsent(key, () => []).add(size);
     }
 
+    setState(() {
+      _aspectRatioToResolutions = grouped;
+      _selectedAspectRatio = grouped.keys.first;
+      _selectedResolution = grouped[_selectedAspectRatio!]!.first;
+    });
+
+    _initializeCameraController();
+  }
+
+  String _approximateAspectRatio(double ratio) {
+    const threshold = 0.05;
+
+    if ((ratio - 4 / 3).abs() < threshold) return '4:3';
+    if ((ratio - 16 / 9).abs() < threshold) return '16:9';
+    if ((ratio - 1.0).abs() < threshold) return '1:1';
+
+    // ไม่จัดกลุ่มอื่น ๆ
+    return ''; // หรือ return null แล้วเช็คภายหลัง
+  }
+
+  Future<void> _initializeCameraController() async {
+    try {
+      await _controller.dispose();
+    } catch (_) {}
     _controller = CameraController(widget.camera, ResolutionPreset.max);
     _initializeControllerFuture = _controller.initialize();
     await _initializeControllerFuture;
@@ -75,7 +79,7 @@ class _CameraScreenState extends State<CameraScreen> {
     if (newRatio == null) return;
     setState(() {
       _selectedAspectRatio = newRatio;
-      _selectedResolution = aspectRatioToResolutions[newRatio]!.first;
+      _selectedResolution = _aspectRatioToResolutions[newRatio]?.first;
     });
     _initializeCameraController();
   }
@@ -108,12 +112,14 @@ class _CameraScreenState extends State<CameraScreen> {
         );
         print("Image saved to gallery: $result");
 
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => DisplayPictureScreen(imagePath: imagePath),
-          ),
-        );
+        if (mounted) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => DisplayPictureScreen(imagePath: imagePath),
+            ),
+          );
+        }
       } else {
         print('Failed to take picture or image path is empty');
       }
@@ -131,9 +137,7 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Camera with Aspect Ratio & Resolution'),
-      ),
+      appBar: AppBar(title: const Text('Camera with Dynamic Resolutions')),
       body: (_controller.value.isInitialized)
           ? Column(
               children: [
@@ -145,7 +149,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 const Text('เลือกอัตราส่วนภาพ'),
                 DropdownButton<String>(
                   value: _selectedAspectRatio,
-                  items: aspectRatioToResolutions.keys.map((ratio) {
+                  items: _aspectRatioToResolutions.keys.map((ratio) {
                     return DropdownMenuItem(value: ratio, child: Text(ratio));
                   }).toList(),
                   onChanged: _onAspectRatioChanged,
@@ -154,7 +158,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 const Text('เลือกความละเอียดภาพถ่าย'),
                 DropdownButton<Size>(
                   value: _selectedResolution,
-                  items: aspectRatioToResolutions[_selectedAspectRatio]!.map((
+                  items: _aspectRatioToResolutions[_selectedAspectRatio]?.map((
                     size,
                   ) {
                     return DropdownMenuItem(
