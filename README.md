@@ -1,2 +1,2 @@
 # open_camera
-native_camera = flutter
+native_camera + flutter
