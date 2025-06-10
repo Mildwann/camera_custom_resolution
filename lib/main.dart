@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:open_camera/ImagePreviewPage.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -18,6 +19,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Native Camera Dynamic Resolution',
       home: const CameraPage(),
+      debugShowCheckedModeBanner: false,
     );
   }
 }
@@ -130,8 +132,9 @@ class _CameraPageState extends State<CameraPage> {
     }
     try {
       final String imagePath = await platform.invokeMethod('takePicture');
+
       if (imagePath.isNotEmpty) {
-        // เปิด modal fullscreen แสดงภาพ
+        await ImageGallerySaverPlus.saveFile(imagePath);
         if (!mounted) return;
         await Navigator.push(
           context,
