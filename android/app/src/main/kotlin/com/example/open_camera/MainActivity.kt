@@ -1,6 +1,5 @@
 package com.example.open_camera
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
@@ -31,15 +30,17 @@ class MainActivity : FlutterActivity() {
     private var surfaceTextureEntry: TextureRegistry.SurfaceTextureEntry? = null
     private var previewSize: Size? = null
     private var imageReader: ImageReader? = null
-    
 
-    // Handler สำหรับ ImageReader callback
+    private lateinit var methodChannelResult: MethodChannel.Result
+
+    private var cameraId: String = ""
+    private var isUsingFrontCamera = false
+    private var isFlashOn = false
+
     private val backgroundHandler: Handler by lazy {
         val thread = HandlerThread("CameraBackground").also { it.start() }
         Handler(thread.looper)
     }
-
-    private lateinit var methodChannelResult: MethodChannel.Result
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -64,6 +65,12 @@ class MainActivity : FlutterActivity() {
                 "takePicture" -> {
                     takePicture(result)
                 }
+                "switchCamera" -> {
+                    switchCamera(result, flutterEngine)
+                }
+                "toggleFlash" -> {
+                    toggleFlash(result)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -71,8 +78,8 @@ class MainActivity : FlutterActivity() {
 
     private fun getSupportedResolutions(): List<Map<String, Int>> {
         try {
-            val cameraId = cameraManager.cameraIdList[0] // กล้องหลัง
-            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val id = getCameraId(false) ?: return emptyList()
+            val characteristics = cameraManager.getCameraCharacteristics(id)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf()
             return sizes.map { size -> mapOf("width" to size.width, "height" to size.height) }
@@ -82,20 +89,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun openCamera(width: Int, height: Int, result: MethodChannel.Result, flutterEngine: FlutterEngine) {
-        val cameraId = cameraManager.cameraIdList[0]
-        previewSize = Size(width, height)
+    private fun getCameraId(useFront: Boolean): String? {
+        for (id in cameraManager.cameraIdList) {
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (useFront && facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                return id
+            } else if (!useFront && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                return id
+            }
+        }
+        return null
+    }
 
+    private fun openCamera(width: Int, height: Int, result: MethodChannel.Result, flutterEngine: FlutterEngine) {
+        cameraId = getCameraId(isUsingFrontCamera) ?: run {
+            result.error("ERROR", "No camera found", null)
+            return
+        }
+
+        previewSize = Size(width, height)
         closeCamera()
 
         surfaceTextureEntry = flutterEngine.renderer.createSurfaceTexture()
-
         if (surfaceTextureEntry == null) {
             result.error("UNAVAILABLE", "Failed to create SurfaceTexture", null)
             return
         }
 
-        // สร้าง ImageReader สำหรับถ่ายภาพความละเอียดเท่ากับ preview
         imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 1)
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -140,12 +161,16 @@ class MainActivity : FlutterActivity() {
         try {
             val captureRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             captureRequestBuilder.addTarget(previewSurface)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+
+            if (!isUsingFrontCamera && isFlashOn) {
+                captureRequestBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            }
 
             cameraDevice!!.createCaptureSession(listOf(previewSurface, captureSurface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     captureSession = session
                     try {
-                        captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                         captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
                         result?.success(surfaceTextureEntry!!.id())
                     } catch (e: CameraAccessException) {
@@ -167,9 +192,8 @@ class MainActivity : FlutterActivity() {
             result.error("ERROR", "Camera not opened", null)
             return
         }
-        previewSize = Size(width, height)
 
-        // ปิด ImageReader เดิมแล้วสร้างใหม่
+        previewSize = Size(width, height)
         imageReader?.close()
         imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 1)
         imageReader?.setOnImageAvailableListener({ reader ->
@@ -192,69 +216,108 @@ class MainActivity : FlutterActivity() {
 
     private var takePictureResult: MethodChannel.Result? = null
 
-private fun takePicture(result: MethodChannel.Result) {
-    if (cameraDevice == null || captureSession == null || imageReader == null) {
-        result.error("ERROR", "Camera not ready", null)
-        return
-    }
+    private fun takePicture(result: MethodChannel.Result) {
+        if (cameraDevice == null || captureSession == null || imageReader == null) {
+            result.error("ERROR", "Camera not ready", null)
+            return
+        }
 
-    takePictureResult = result // store result for later
+        takePictureResult = result
 
-    try {
-        val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-        captureBuilder.addTarget(imageReader!!.surface)
-        captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        try {
+            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder.addTarget(imageReader!!.surface)
+            captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
-        captureSession!!.stopRepeating()
-
-        captureSession!!.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
-            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, resultCapture: TotalCaptureResult) {
-                super.onCaptureCompleted(session, request, resultCapture)
-                try {
-                    val previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                    previewRequestBuilder.addTarget(Surface(surfaceTextureEntry!!.surfaceTexture()))
-                    previewRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    session.setRepeatingRequest(previewRequestBuilder.build(), null, backgroundHandler)
-                } catch (e: CameraAccessException) {
-                    Log.e("NativeCamera", "Error restarting preview: $e")
-                }
+            if (!isUsingFrontCamera && isFlashOn) {
+                captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
             }
-        }, backgroundHandler)
 
-    } catch (e: CameraAccessException) {
-        result.error("ERROR", "Failed to capture picture: ${e.message}", null)
+            captureSession!!.stopRepeating()
+
+            captureSession!!.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, resultCapture: TotalCaptureResult) {
+                    super.onCaptureCompleted(session, request, resultCapture)
+                    try {
+                        val previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                        previewRequestBuilder.addTarget(Surface(surfaceTextureEntry!!.surfaceTexture()))
+                        previewRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+
+                        if (!isUsingFrontCamera && isFlashOn) {
+                            previewRequestBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+                        }
+
+                        session.setRepeatingRequest(previewRequestBuilder.build(), null, backgroundHandler)
+                    } catch (e: CameraAccessException) {
+                        Log.e("NativeCamera", "Error restarting preview: $e")
+                    }
+                }
+            }, backgroundHandler)
+
+        } catch (e: CameraAccessException) {
+            result.error("ERROR", "Failed to capture picture: ${e.message}", null)
+        }
     }
-}
 
+    private fun toggleFlash(result: MethodChannel.Result) {
+        isFlashOn = !isFlashOn
 
- private fun saveImage(bytes: ByteArray) {
-    val filename = "IMG_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
-    var savedPath: String? = null
+        if (cameraDevice == null || captureSession == null || surfaceTextureEntry == null) {
+            result.error("ERROR", "Camera not ready", null)
+            return
+        }
 
-    try {
-        val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        try {
+            val previewSurface = Surface(surfaceTextureEntry!!.surfaceTexture())
+            val captureRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            captureRequestBuilder.addTarget(previewSurface)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
-        val cameraId = cameraManager.cameraIdList[0]
-        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val orientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            if (!isUsingFrontCamera) {
+                captureRequestBuilder.set(
+                    CaptureRequest.FLASH_MODE,
+                    if (isFlashOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF
+                )
+            }
 
-        val matrix = android.graphics.Matrix()
-        matrix.postRotate(orientation.toFloat())
-        val rotatedBitmap = android.graphics.Bitmap.createBitmap(
-            originalBitmap,
-            0,
-            0,
-            originalBitmap.width,
-            originalBitmap.height,
-            matrix,
-            true
-        )
+            captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
+            result.success(isFlashOn)
+        } catch (e: Exception) {
+            result.error("ERROR", "Failed to toggle flash: ${e.message}", null)
+        }
+    }
 
-        val outputStream = java.io.ByteArrayOutputStream()
-        rotatedBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, outputStream)
-        val rotatedBytes = outputStream.toByteArray()
+    private fun switchCamera(result: MethodChannel.Result, flutterEngine: FlutterEngine) {
+        isUsingFrontCamera = !isUsingFrontCamera
+        cameraId = getCameraId(isUsingFrontCamera) ?: run {
+            result.error("ERROR", "No camera found", null)
+            return
+        }
+        openCamera(previewSize?.width ?: 640, previewSize?.height ?: 480, result, flutterEngine)
+    }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun saveImage(bytes: ByteArray) {
+        val filename = "IMG_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
+        var savedPath: String? = null
+
+        try {
+            val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val orientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+
+            val matrix = android.graphics.Matrix()
+            matrix.postRotate(orientation.toFloat())
+            val rotatedBitmap = android.graphics.Bitmap.createBitmap(
+                originalBitmap, 0, 0,
+                originalBitmap.width, originalBitmap.height,
+                matrix, true
+            )
+
+            val outputStream = java.io.ByteArrayOutputStream()
+            rotatedBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, outputStream)
+            val rotatedBytes = outputStream.toByteArray()
+
             val picturesDir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "MyCameraApp")
             if (!picturesDir.exists()) picturesDir.mkdirs()
 
@@ -263,30 +326,15 @@ private fun takePicture(result: MethodChannel.Result) {
 
             savedPath = file.absolutePath
             Log.d("NativeCamera", "Saved rotated image to $savedPath")
-        } else {
-            val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-            val file = File(picturesDir, filename)
-            FileOutputStream(file).use { it.write(rotatedBytes) }
 
-            val intent = android.content.Intent(android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-            intent.data = android.net.Uri.fromFile(file)
-            sendBroadcast(intent)
-
-            savedPath = file.absolutePath
-            Log.d("NativeCamera", "Saved rotated image to $savedPath")
+            takePictureResult?.success(savedPath)
+        } catch (e: Exception) {
+            Log.e("NativeCamera", "Failed to save rotated image: ${e.message}")
+            takePictureResult?.error("ERROR", "Failed to save image: ${e.message}", null)
+        } finally {
+            takePictureResult = null
         }
-
-        takePictureResult?.success(savedPath)
-        takePictureResult = null
-
-    } catch (e: Exception) {
-        Log.e("NativeCamera", "Failed to save rotated image: ${e.message}")
-        takePictureResult?.error("ERROR", "Failed to save image: ${e.message}", null)
-        takePictureResult = null
     }
-}
-
-
 
     private fun closeCamera() {
         captureSession?.close()

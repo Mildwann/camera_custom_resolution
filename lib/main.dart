@@ -1,5 +1,3 @@
-import 'dart:io';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
@@ -36,6 +34,8 @@ class _CameraPageState extends State<CameraPage> {
   Size? selectedResolution;
   int? _textureId;
   String? lastCapturedImagePath;
+  bool isRearCamera = true;
+  bool isFlashOn = false;
 
   @override
   void initState() {
@@ -82,9 +82,10 @@ class _CameraPageState extends State<CameraPage> {
 
       Map<String, List<Size>> grouped = {};
       for (final size in resolutions) {
-        final ratio = size.width / size.height;
-        final ratioStr = _aspectRatioLabel(ratio);
-        grouped.putIfAbsent(ratioStr, () => []).add(size);
+        final String? ratioStr = _aspectRatioLabel(size.width / size.height);
+        if (ratioStr != null && ratioStr.isNotEmpty) {
+          grouped.putIfAbsent(ratioStr, () => []).add(size);
+        }
       }
 
       grouped.forEach((key, list) {
@@ -98,11 +99,11 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  String _aspectRatioLabel(double ratio) {
+  String? _aspectRatioLabel(double ratio) {
     if ((ratio - 4 / 3).abs() < 0.1) return '4:3';
     if ((ratio - 16 / 9).abs() < 0.1) return '16:9';
     if ((ratio - 1).abs() < 0.1) return '1:1';
-    return ratio.toStringAsFixed(2);
+    return null;
   }
 
   Future<void> openCamera(Size resolution) async {
@@ -143,6 +144,9 @@ class _CameraPageState extends State<CameraPage> {
             builder: (_) => ImagePreviewPage(imagePath: imagePath),
           ),
         );
+        setState(() {
+          lastCapturedImagePath = imagePath;
+        });
       }
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -152,87 +156,206 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
+  void _showSettingsSheet(BuildContext context) {
     final resolutions = selectedAspectRatio != null
         ? groupedResolutions[selectedAspectRatio] ?? []
         : [];
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Dynamic Camera Resolution')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text("Aspect Ratio:"),
-            DropdownButton<String>(
-              value: selectedAspectRatio,
-              isExpanded: true,
-              items: groupedResolutions.keys
-                  .map(
-                    (ratio) =>
-                        DropdownMenuItem(value: ratio, child: Text(ratio)),
-                  )
-                  .toList(),
-              onChanged: (value) async {
-                setState(() {
-                  selectedAspectRatio = value;
-                  final list = groupedResolutions[value] ?? [];
-                  selectedResolution = list.isNotEmpty ? list.first : null;
-                });
-                if (selectedResolution != null) {
-                  await openCamera(selectedResolution!);
-                }
-              },
-            ),
-            const SizedBox(height: 10),
-            const Text("Resolution:"),
-            DropdownButton<Size>(
-              value: selectedResolution,
-              isExpanded: true,
-              hint: const Text("Select resolution"),
-              items: resolutions.map((res) {
-                return DropdownMenuItem<Size>(
-                  value: res,
-                  child: Text('${res.width.toInt()} x ${res.height.toInt()}'),
-                );
-              }).toList(),
-              onChanged: (value) async {
-                setState(() {
-                  selectedResolution = value;
-                });
-                if (value != null) {
-                  await openCamera(value);
-                }
-              },
-            ),
-            const SizedBox(height: 20),
-            if (_textureId != null && selectedResolution != null)
-              AspectRatio(
-                aspectRatio:
-                    selectedResolution!.height / selectedResolution!.width,
-                child: Texture(textureId: _textureId!),
-              ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: takePicture,
-              child: const Text('Take Picture'),
-            ),
-            if (lastCapturedImagePath != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Last captured image:'),
-                    SizedBox(
-                      height: 200,
-                      child: Image.file(File(lastCapturedImagePath!)),
-                    ),
-                  ],
+    showModalBottomSheet(
+      backgroundColor: const Color(0xFF222222),
+      context: context,
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Settings',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
                 ),
               ),
+              const SizedBox(height: 16),
+
+              Text("Aspect Ratio:", style: TextStyle(color: Colors.white70)),
+              DropdownButton<String>(
+                dropdownColor: const Color(0xFF333333),
+                value: selectedAspectRatio,
+                isExpanded: true,
+                style: const TextStyle(color: Colors.white),
+                items: groupedResolutions.keys
+                    .map(
+                      (ratio) =>
+                          DropdownMenuItem(value: ratio, child: Text(ratio)),
+                    )
+                    .toList(),
+                onChanged: (value) async {
+                  setState(() {
+                    selectedAspectRatio = value;
+                    final list = groupedResolutions[value] ?? [];
+                    selectedResolution = list.isNotEmpty ? list.first : null;
+                  });
+                  if (selectedResolution != null) {
+                    await openCamera(selectedResolution!);
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+
+              const SizedBox(height: 12),
+
+              Text("Resolution:", style: TextStyle(color: Colors.white70)),
+              DropdownButton<Size>(
+                dropdownColor: const Color(0xFF333333),
+                value: selectedResolution,
+                isExpanded: true,
+                style: const TextStyle(color: Colors.white),
+                hint: const Text(
+                  "Select resolution",
+                  style: TextStyle(color: Colors.white70),
+                ),
+                items: resolutions.map((res) {
+                  return DropdownMenuItem<Size>(
+                    value: res,
+                    child: Text('${res.width.toInt()} x ${res.height.toInt()}'),
+                  );
+                }).toList(),
+                onChanged: (value) async {
+                  setState(() {
+                    selectedResolution = value;
+                  });
+                  if (value != null) {
+                    await openCamera(value);
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            // กล้อง Preview
+            Column(
+              children: [
+                if (_textureId != null && selectedResolution != null)
+                  Expanded(
+                    child: Center(
+                      child: AspectRatio(
+                        aspectRatio:
+                            selectedResolution!.height /
+                            selectedResolution!.width,
+                        child: Texture(textureId: _textureId!),
+                      ),
+                    ),
+                  )
+                else
+                  const Expanded(
+                    child: Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    ),
+                  ),
+              ],
+            ),
+
+            // Top bar
+            Positioned(
+              top: 0,
+              left: 16,
+              right: 16,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.settings, color: Colors.white),
+                    onPressed: () => _showSettingsSheet(context),
+                  ),
+                  IconButton(
+                    icon: Icon(
+                      isFlashOn ? Icons.flash_on : Icons.flash_off,
+                      color: Colors.white70,
+                    ),
+                    onPressed: () async {
+                      try {
+                        await platform.invokeMethod('toggleFlash');
+                        setState(() {
+                          isFlashOn = !isFlashOn;
+                        });
+                      } catch (e) {
+                        debugPrint('Error toggling flash: $e');
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ),
+
+            // Bottom bar
+            // Bottom bar
+            Positioned(
+              bottom: 24,
+              left: 0,
+              right: 0,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  // ซ้าย: Placeholder (ไม่แสดงอะไรแต่ยังเว้นที่ไว้ให้ตรงกลางสมดุล)
+                  const SizedBox(width: 48),
+
+                  // ปุ่มถ่ายภาพ
+                  GestureDetector(
+                    onTap: takePicture,
+                    child: Container(
+                      width: 72,
+                      height: 72,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white,
+                        border: Border.all(color: Colors.grey[400]!, width: 2),
+                      ),
+                      child: Container(
+                        margin: const EdgeInsets.all(8),
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.black,
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // ขวา: Flip Camera
+                  IconButton(
+                    icon: const Icon(Icons.cameraswitch, color: Colors.white70),
+                    onPressed: () async {
+                      try {
+                        final textureId = await platform.invokeMethod(
+                          'switchCamera',
+                        );
+                        setState(() {
+                          isRearCamera = !isRearCamera;
+                          _textureId = textureId;
+                        });
+                      } catch (e) {
+                        debugPrint('Error switching camera: $e');
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       ),
